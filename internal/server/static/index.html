@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HAR Filter</title>
+    <script>
+      (() => {
+        try {
+          const savedTheme = window.localStorage.getItem("har-filter.theme.v1");
+          const theme = savedTheme === "light" || savedTheme === "dark"
+            ? savedTheme
+            : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          document.documentElement.dataset.theme = theme;
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="topbar">
+        <div>
+          <h1>HAR Filter</h1>
+          <p>Review HAR requests and export only the entries you need</p>
+        </div>
+        <div class="theme-control" role="group" aria-label="Theme">
+          <button id="themeLightButton" type="button" aria-pressed="true">Light</button>
+          <button id="themeDarkButton" type="button" aria-pressed="false">Dark</button>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <section class="request-column">
+          <aside class="summary-panel">
+            <input id="harFile" class="visually-hidden" name="har" type="file" accept=".har,application/json" aria-describedby="selectedFileMeta">
+            <label id="statusMessage" class="upload-field file-picker idle" for="harFile" title="Choose or replace HAR file">
+              <span class="upload-field-label">HAR file</span>
+              <strong id="fileName">No file selected</strong>
+              <span id="selectedFileMeta" class="upload-field-meta">.har or JSON</span>
+              <span id="uploadActionText" class="upload-field-action" role="status" aria-live="polite">Select</span>
+              <span id="uploadErrorText" class="upload-field-error" role="status" aria-live="polite" hidden></span>
+            </label>
+            <div class="summary-line">
+              <span>Requests</span>
+              <strong id="entryCount">0</strong>
+            </div>
+            <div class="summary-line">
+              <span>Selected</span>
+              <strong id="selectedCount">0</strong>
+            </div>
+            <button id="exportButton" type="button" disabled>Export selected</button>
+          </aside>
+
+          <section class="table-panel">
+            <div class="toolbar">
+              <span class="type-filter-label">Type</span>
+              <div id="resourceTypeFilters" class="type-filter-group" role="group" aria-label="Resource type filters"></div>
+              <label for="filterInput">Filter</label>
+              <input id="filterInput" type="search" placeholder="Search method, status, host, or path">
+              <label class="page-size-control" for="pageSizeSelect">
+                <span>Rows</span>
+                <select id="pageSizeSelect">
+                  <option value="10">10</option>
+                  <option value="25" selected>25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="select-cell">
+                      <input id="selectAllVisibleCheckbox" type="checkbox" aria-label="Select or clear visible requests" disabled>
+                    </th>
+                    <th>Method</th>
+                    <th>URL</th>
+                    <th>Status</th>
+                    <th>Time</th>
+                    <th>Size</th>
+                    <th>Type</th>
+                  </tr>
+                </thead>
+                <tbody id="entriesBody" class="is-empty">
+                  <tr>
+                    <td colspan="7" class="empty-cell">Upload a HAR file to view requests</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="pagination-bar">
+              <p id="paginationSummary" class="pagination-summary">0 requests</p>
+              <div class="pagination-actions">
+                <button id="prevPageButton" type="button" disabled>Previous</button>
+                <span id="pageIndicator" class="page-indicator">Page 1 of 1</span>
+                <button id="nextPageButton" type="button" disabled>Next</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <aside id="requestPanel" class="detail-panel request-panel detail-column">
+          <div class="detail-panel-header">
+            <div>
+              <h2>Request</h2>
+            </div>
+          </div>
+          <div id="requestScroll" class="detail-scroll">
+            <div class="detail-header detail-method">
+              <span>Method</span>
+              <strong id="requestMethod"></strong>
+            </div>
+            <div class="detail-header detail-summary">
+              <span>URL</span>
+              <strong id="requestMeta"></strong>
+            </div>
+            <div class="detail-header detail-status">
+              <span>Status</span>
+              <strong id="requestStatus"></strong>
+            </div>
+            <div id="requestHeaders" class="detail-headers"></div>
+            <div class="detail-body-section">
+              <div class="detail-body-toolbar">
+                <span>Body</span>
+                <div class="detail-body-actions">
+                  <button id="requestBodyCopyButton" type="button" disabled>Copy</button>
+                  <button id="requestBodyOpenButton" type="button" disabled>Open</button>
+                </div>
+              </div>
+              <pre id="requestBody" class="detail-body">No request selected</pre>
+            </div>
+          </div>
+        </aside>
+
+        <aside id="responsePanel" class="detail-panel response-panel detail-column">
+          <div class="detail-panel-header">
+            <div>
+              <h2>Response</h2>
+            </div>
+          </div>
+          <div id="responseScroll" class="detail-scroll">
+            <div class="detail-header detail-method">
+              <span>Method</span>
+              <strong id="responseMethod"></strong>
+            </div>
+            <div class="detail-header detail-summary">
+              <span>URL</span>
+              <strong id="responseMeta"></strong>
+            </div>
+            <div class="detail-header detail-status">
+              <span>Status</span>
+              <strong id="responseStatus"></strong>
+            </div>
+            <div id="responseHeaders" class="detail-headers"></div>
+            <div class="detail-body-section">
+              <div class="detail-body-toolbar">
+                <span>Body</span>
+                <div class="detail-body-actions">
+                  <button id="responseBodyCopyButton" type="button" disabled>Copy</button>
+                  <button id="responseBodyOpenButton" type="button" disabled>Open</button>
+                </div>
+              </div>
+              <pre id="responseBody" class="detail-body">No response selected</pre>
+            </div>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <dialog id="bodyDialog" class="body-dialog" aria-labelledby="bodyDialogTitle">
+      <form method="dialog" class="body-dialog-shell">
+        <div class="body-dialog-header">
+          <div>
+            <h2 id="bodyDialogTitle">Body</h2>
+            <p id="bodyDialogMeta"></p>
+          </div>
+          <div class="body-dialog-actions" role="group" aria-label="Body view mode">
+            <button id="bodyDialogPrettyButton" type="button" class="active">Pretty</button>
+            <button id="bodyDialogRawButton" type="button">Raw</button>
+          </div>
+          <div class="body-dialog-copy-actions" role="group" aria-label="Copy body">
+            <button id="bodyDialogCopyPrettyButton" type="button">Copy Pretty</button>
+            <button id="bodyDialogCopyRawButton" type="button">Copy Raw</button>
+          </div>
+          <button id="bodyDialogCloseButton" type="submit" value="close">Close</button>
+        </div>
+        <pre id="bodyDialogContent" class="body-dialog-content" tabindex="0"></pre>
+      </form>
+    </dialog>
+
+    <dialog id="entryDialog" class="entry-dialog" aria-labelledby="entryDialogTitle">
+      <form method="dialog" class="entry-dialog-shell">
+        <div class="entry-dialog-header">
+          <div>
+            <h2 id="entryDialogTitle">Request / Response</h2>
+            <p>Selected request detail</p>
+          </div>
+          <button id="entryDialogCloseButton" type="submit" value="close">Close</button>
+        </div>
+        <div class="entry-dialog-content">
+          <section class="entry-dialog-panel">
+            <header>
+              <h3>Request</h3>
+              <p id="entryDialogRequestMeta"></p>
+            </header>
+            <div id="entryDialogRequest" class="entry-dialog-scroll" tabindex="0" aria-label="Request detail"></div>
+          </section>
+          <section class="entry-dialog-panel">
+            <header>
+              <h3>Response</h3>
+              <p id="entryDialogResponseMeta"></p>
+            </header>
+            <div id="entryDialogResponse" class="entry-dialog-scroll" tabindex="0" aria-label="Response detail"></div>
+          </section>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
