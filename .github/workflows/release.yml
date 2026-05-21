@@ -1,0 +1,252 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "release workflow must run from public main" >&2
+            exit 1
+          fi
+          if [[ ! -f VERSION ]]; then
+            echo "VERSION file is required for release automation" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid VERSION: $version" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          git fetch --force --prune origin '+refs/heads/main:refs/remotes/origin/main'
+          main_commit="$(git rev-parse origin/main)"
+          if [[ "$main_commit" != "$GITHUB_SHA" ]]; then
+            echo "workflow SHA $GITHUB_SHA is not current public main $main_commit" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $tag"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "tag exists without a GitHub Release: $tag" >&2
+            exit 1
+          fi
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+            runner: ubuntu-22.04
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+            runner: ubuntu-22.04
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+            runner: macos-14
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+            runner: macos-14
+          - goos: windows
+            goarch: amd64
+            archive: zip
+            runner: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        shell: bash
+        env:
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg
+          binary="harserver"
+          if [[ "$TARGET_GOOS" == "windows" ]]; then
+            binary="harserver.exe"
+          fi
+          GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" go build -trimpath -o "dist/pkg/$binary" ./cmd/harserver
+          cp README.md dist/pkg/README.md
+          cp LICENSE dist/pkg/LICENSE
+
+      - name: Package tar asset
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          asset="har-filter-${RELEASE_VERSION}-${TARGET_GOOS}-${TARGET_GOARCH}"
+          mv dist/pkg "dist/${asset}"
+          tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
+          rm -rf "dist/${asset}"
+
+      - name: Package zip asset
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+        run: |
+          $asset = "har-filter-$env:RELEASE_VERSION-$env:TARGET_GOOS-$env:TARGET_GOARCH"
+          Move-Item -Path dist/pkg -Destination "dist/$asset"
+          Compress-Archive -Path "dist/$asset" -DestinationPath "dist/$asset.zip"
+          Remove-Item -Recurse -Force "dist/$asset"
+
+      - name: Verify packaged asset manifest
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+          TARGET_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          asset="har-filter-${RELEASE_VERSION}-${TARGET_GOOS}-${TARGET_GOARCH}"
+          binary="harserver"
+          if [[ "$TARGET_GOOS" == "windows" ]]; then
+            binary="harserver.exe"
+          fi
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          if [[ "$TARGET_ARCHIVE" == "zip" ]]; then
+            unzip -q "dist/${asset}.zip" -d "$verify_dir"
+          else
+            tar -C "$verify_dir" -xzf "dist/${asset}.tar.gz"
+          fi
+          test -f "$verify_dir/${asset}/${binary}"
+          test -f "$verify_dir/${asset}/README.md"
+          test -f "$verify_dir/${asset}/LICENSE"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: har-filter-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download packaged assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+
+      - name: Create public repository release token
+        id: public-release-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.PUBLIC_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUBLIC_RELEASE_APP_PRIVATE_KEY }}
+          owner: Hamachi-Multi
+          repositories: har-filter
+          permission-contents: write
+
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ steps.public-release-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/heads/main:refs/remotes/origin/main'
+          if [[ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]]; then
+            echo "workflow SHA $GITHUB_SHA is not current public main" >&2
+            exit 1
+          fi
+          prerelease_arg=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            prerelease_arg=(--prerelease)
+          fi
+          gh release create "$RELEASE_VERSION" \
+            dist/*.tar.gz \
+            dist/*.zip \
+            dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_VERSION" \
+            --generate-notes \
+            "${prerelease_arg[@]}"

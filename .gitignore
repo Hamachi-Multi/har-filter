@@ -1,0 +1,4 @@
+/harserver
+/harserver.exe
+dist/
+*.log
