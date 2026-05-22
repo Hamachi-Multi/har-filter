@@ -44,12 +44,46 @@ jobs:
             echo "VERSION file is required for release automation" >&2
             exit 1
           fi
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "CHANGELOG.md file is required for release automation" >&2
+            exit 1
+          fi
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "invalid VERSION: $version" >&2
             exit 1
           fi
           tag="v${version}"
+          notes_file="$(mktemp)"
+          awk -v tag="$tag" '
+            /^##[[:space:]]+/ {
+              heading = $0
+              sub(/^##[[:space:]]+/, "", heading)
+              split(heading, parts, /[[:space:]]/)
+              if (parts[1] == tag) {
+                found = 1
+                next
+              }
+              if (found) {
+                exit
+              }
+            }
+            found {
+              print
+            }
+            END {
+              if (!found) {
+                exit 2
+              }
+            }
+          ' CHANGELOG.md > "$notes_file" || {
+            echo "CHANGELOG.md section is required for $tag" >&2
+            exit 1
+          }
+          if [[ ! -s "$notes_file" ]] || ! grep -Eq '[^[:space:]]' "$notes_file"; then
+            echo "CHANGELOG.md section for $tag is empty" >&2
+            exit 1
+          fi
           git fetch --force --prune origin '+refs/heads/main:refs/remotes/origin/main'
           main_commit="$(git rev-parse origin/main)"
           if [[ "$main_commit" != "$GITHUB_SHA" ]]; then
@@ -216,6 +250,42 @@ jobs:
           cd dist
           sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
 
+      - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          awk -v tag="$RELEASE_VERSION" '
+            /^##[[:space:]]+/ {
+              heading = $0
+              sub(/^##[[:space:]]+/, "", heading)
+              split(heading, parts, /[[:space:]]/)
+              if (parts[1] == tag) {
+                found = 1
+                next
+              }
+              if (found) {
+                exit
+              }
+            }
+            found {
+              print
+            }
+            END {
+              if (!found) {
+                exit 2
+              }
+            }
+          ' CHANGELOG.md > "$notes_file" || {
+            echo "CHANGELOG.md section is required for $RELEASE_VERSION" >&2
+            exit 1
+          }
+          if [[ ! -s "$notes_file" ]] || ! grep -Eq '[^[:space:]]' "$notes_file"; then
+            echo "CHANGELOG.md section for $RELEASE_VERSION is empty" >&2
+            exit 1
+          fi
+
       - name: Create public repository release token
         id: public-release-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
@@ -248,5 +318,5 @@ jobs:
             dist/SHA256SUMS \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_VERSION" \
-            --generate-notes \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             "${prerelease_arg[@]}"
