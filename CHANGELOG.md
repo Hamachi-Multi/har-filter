@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.6
+
+- Stream selected HAR exports without rebuilding the full subset response buffer
+- Bound entry detail body previews before full text materialization and preserve truncation semantics for large, wrapped, and malformed bodies
+- Align release setup and README API/runtime documentation with the current workflow and server behavior
+
 ## v0.1.5
 
 - Use curated `CHANGELOG.md` sections for GitHub Release notes

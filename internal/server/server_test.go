@@ -506,6 +506,9 @@ func TestExportRejectsMissingSessionAndInvalidIndexes(t *testing.T) {
 	if invalidResponse.Code != http.StatusBadRequest {
 		t.Fatalf("invalid index status = %d, want 400; body = %s", invalidResponse.Code, invalidResponse.Body.String())
 	}
+	if disposition := invalidResponse.Header().Get("Content-Disposition"); disposition != "" {
+		t.Fatalf("invalid index response content disposition = %q, want empty", disposition)
+	}
 }
 
 func TestIndexUsesSingleFilePickerClickTarget(t *testing.T) {
