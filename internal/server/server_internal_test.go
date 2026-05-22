@@ -3,9 +3,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -89,6 +92,72 @@ func TestSessionExpiryTimerStopsWhenSessionIsReplaced(t *testing.T) {
 	}
 }
 
+func TestUploadRejectsConcurrentRequestsAboveInflightBudget(t *testing.T) {
+	app := New(Config{
+		MaxUploadBytes:         1 << 20,
+		MaxInflightUploadBytes: 1 << 20,
+	})
+	hold := make(chan struct{})
+	firstDone := make(chan int, 1)
+	var firstStarted sync.WaitGroup
+	firstStarted.Add(1)
+
+	go func() {
+		body := &blockingBody{
+			prefix: []byte("not a complete multipart body"),
+			hold:   hold,
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+		request.Header.Set("Content-Type", "multipart/form-data; boundary=hold")
+		response := httptest.NewRecorder()
+		firstStarted.Done()
+		app.ServeHTTP(response, request)
+		firstDone <- response.Code
+	}()
+	firstStarted.Wait()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		app.mu.RLock()
+		inflight := app.inflightUploadBytes
+		app.mu.RUnlock()
+		if inflight > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	response := uploadInternalHARResponse(t, app, "second.har", apiSampleHARInternal)
+	if response.Code != http.StatusTooManyRequests {
+		close(hold)
+		t.Fatalf("second upload status = %d, want 429; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "too many uploads") {
+		close(hold)
+		t.Fatalf("second upload body = %s, want too many uploads error", response.Body.String())
+	}
+
+	close(hold)
+	if code := <-firstDone; code == http.StatusTooManyRequests {
+		t.Fatalf("first upload was rejected by inflight budget")
+	}
+
+	deadline = time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		app.mu.RLock()
+		inflight := app.inflightUploadBytes
+		app.mu.RUnlock()
+		if inflight == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	app.mu.RLock()
+	inflight := app.inflightUploadBytes
+	app.mu.RUnlock()
+	t.Fatalf("inflightUploadBytes = %d, want 0 after first upload exits", inflight)
+}
+
 func uploadInternalHAR(t *testing.T, app *App, name string, replaceID string) string {
 	t.Helper()
 	body := &bytes.Buffer{}
@@ -127,6 +196,43 @@ func uploadInternalHAR(t *testing.T, app *App, name string, replaceID string) st
 		t.Fatalf("upload id is empty")
 	}
 	return payload.ID
+}
+
+func uploadInternalHARResponse(t *testing.T, app *App, name string, harBody string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("har", name)
+	if err != nil {
+		t.Fatalf("CreateFormFile returned error: %v", err)
+	}
+	if _, err := part.Write([]byte(harBody)); err != nil {
+		t.Fatalf("write HAR returned error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	app.ServeHTTP(response, request)
+	return response
+}
+
+type blockingBody struct {
+	prefix []byte
+	hold   <-chan struct{}
+	sent   bool
+}
+
+func (b *blockingBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.prefix), nil
+	}
+	<-b.hold
+	return 0, io.EOF
 }
 
 const apiSampleHARInternal = `{

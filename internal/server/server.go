@@ -33,20 +33,23 @@ const (
 var staticFiles embed.FS
 
 type Config struct {
-	MaxUploadBytes  int64
-	MaxSessionBytes int64
-	SessionTTL      time.Duration
+	MaxUploadBytes         int64
+	MaxSessionBytes        int64
+	MaxInflightUploadBytes int64
+	SessionTTL             time.Duration
 }
 
 type App struct {
-	mux             *http.ServeMux
-	maxUploadBytes  int64
-	maxSessionBytes int64
-	sessionTTL      time.Duration
+	mux                    *http.ServeMux
+	maxUploadBytes         int64
+	maxSessionBytes        int64
+	maxInflightUploadBytes int64
+	sessionTTL             time.Duration
 
-	mu                sync.RWMutex
-	sessions          map[string]*session
-	totalSessionBytes int64
+	mu                  sync.RWMutex
+	sessions            map[string]*session
+	totalSessionBytes   int64
+	inflightUploadBytes int64
 }
 
 type session struct {
@@ -91,17 +94,25 @@ func New(config Config) *App {
 			maxSessionBytes = maxUploadBytes
 		}
 	}
+	maxInflightUploadBytes := config.MaxInflightUploadBytes
+	if maxInflightUploadBytes <= 0 {
+		maxInflightUploadBytes = maxSessionBytes
+	}
+	if maxInflightUploadBytes < maxUploadBytes {
+		maxInflightUploadBytes = maxUploadBytes
+	}
 	sessionTTL := config.SessionTTL
 	if sessionTTL <= 0 {
 		sessionTTL = defaultSessionTTL
 	}
 
 	app := &App{
-		mux:             http.NewServeMux(),
-		maxUploadBytes:  maxUploadBytes,
-		maxSessionBytes: maxSessionBytes,
-		sessionTTL:      sessionTTL,
-		sessions:        make(map[string]*session),
+		mux:                    http.NewServeMux(),
+		maxUploadBytes:         maxUploadBytes,
+		maxSessionBytes:        maxSessionBytes,
+		maxInflightUploadBytes: maxInflightUploadBytes,
+		sessionTTL:             sessionTTL,
+		sessions:               make(map[string]*session),
 	}
 	app.routes()
 	return app
@@ -133,6 +144,12 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, errorResponse{Error: "cross-origin request blocked"})
 		return
 	}
+	reservedUploadBytes := a.maxUploadBytes
+	if !a.tryReserveInflightUpload(reservedUploadBytes) {
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{Error: "too many uploads in progress"})
+		return
+	}
+	defer a.releaseInflightUpload(reservedUploadBytes)
 
 	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadBytes+multipartOverhead)
 	reader, err := r.MultipartReader()
@@ -411,6 +428,25 @@ func (a *App) evictOldestUntilFitsLocked(incomingBytes int64) bool {
 		a.deleteSessionLocked(oldestID)
 	}
 	return true
+}
+
+func (a *App) tryReserveInflightUpload(bytes int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.inflightUploadBytes+bytes > a.maxInflightUploadBytes {
+		return false
+	}
+	a.inflightUploadBytes += bytes
+	return true
+}
+
+func (a *App) releaseInflightUpload(bytes int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.inflightUploadBytes -= bytes
+	if a.inflightUploadBytes < 0 {
+		a.inflightUploadBytes = 0
+	}
 }
 
 func newID() (string, error) {

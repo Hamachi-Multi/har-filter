@@ -25,7 +25,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout full history
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
@@ -103,10 +103,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
           go-version-file: go.mod
 
@@ -180,7 +180,7 @@ jobs:
           test -f "$verify_dir/${asset}/LICENSE"
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: har-filter-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -199,13 +199,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout full history
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download packaged assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: dist
           merge-multiple: true
@@ -218,7 +218,7 @@ jobs:
 
       - name: Create public repository release token
         id: public-release-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.PUBLIC_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PUBLIC_RELEASE_APP_PRIVATE_KEY }}
