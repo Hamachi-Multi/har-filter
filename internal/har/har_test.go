@@ -1,8 +1,10 @@
 package har_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -126,6 +128,45 @@ func TestParseSummarizesEntriesAndExportsPrivacyMinimalSubset(t *testing.T) {
 	}
 	if !strings.Contains(string(subset), "/api/orders") {
 		t.Fatalf("subset does not contain selected request: %s", subset)
+	}
+}
+
+func TestWriteSubsetStreamsPrivacyMinimalSubset(t *testing.T) {
+	doc, err := har.Parse([]byte(sampleHAR))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	var out strings.Builder
+	if err := doc.WriteSubset(&out, []int{1}); err != nil {
+		t.Fatalf("WriteSubset returned error: %v", err)
+	}
+
+	subset := out.String()
+	var decoded struct {
+		Log map[string]json.RawMessage `json:"log"`
+	}
+	if err := json.Unmarshal([]byte(subset), &decoded); err != nil {
+		t.Fatalf("streamed subset is invalid JSON: %v", err)
+	}
+	if string(decoded.Log["version"]) != `"1.2"` {
+		t.Fatalf("version = %s, want 1.2", decoded.Log["version"])
+	}
+	if _, ok := decoded.Log["creator"]; ok {
+		t.Fatalf("streamed subset preserves creator metadata: %s", subset)
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(decoded.Log["entries"], &entries); err != nil {
+		t.Fatalf("entries are invalid JSON: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("subset entries = %d, want 1", len(entries))
+	}
+	if strings.Contains(subset, "/api/users") {
+		t.Fatalf("streamed subset contains unselected request: %s", subset)
+	}
+	if !strings.Contains(subset, "/api/orders") {
+		t.Fatalf("streamed subset does not contain selected request: %s", subset)
 	}
 }
 
@@ -321,6 +362,129 @@ func TestResponseDetailLimitsBase64DecodeToPreviewSize(t *testing.T) {
 	}
 }
 
+func TestResponseDetailMarksWrappedBase64PreviewAsTruncated(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 200<<10+4096)))
+	wrapped := strings.Repeat("\n", 4096) + encoded
+	input := `{
+	  "log": {
+	    "entries": [
+	      {
+	        "startedDateTime": "2026-05-17T10:00:00.000Z",
+	        "time": 1,
+	        "request": { "method": "GET", "url": "https://example.com/api/base64-wrapped" },
+	        "response": {
+	          "status": 200,
+	          "content": {
+	            "mimeType": "text/plain",
+	            "encoding": "base64",
+	            "text": ` + quoteJSONString(wrapped) + `
+	          }
+	        }
+	      }
+	    ]
+	  }
+	}`
+
+	doc, err := har.Parse([]byte(input))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	detail, err := doc.ResponseDetail(0)
+	if err != nil {
+		t.Fatalf("ResponseDetail returned error: %v", err)
+	}
+	if !detail.Response.Content.Truncated {
+		t.Fatalf("truncated = false, want true")
+	}
+}
+
+func TestResponseDetailMatchesJSONInvalidUTF8Replacement(t *testing.T) {
+	input := []byte(`{
+	  "log": {
+	    "entries": [
+	      {
+	        "startedDateTime": "2026-05-17T10:00:00.000Z",
+	        "time": 1,
+	        "request": { "method": "GET", "url": "https://example.com/api/invalid-utf8" },
+	        "response": {
+	          "status": 200,
+	          "content": {
+	            "mimeType": "text/plain",
+	            "text": "`)
+	input = append(input, 0xff)
+	input = append(input, []byte(`"
+	          }
+	        }
+	      }
+	    ]
+	  }
+	}`)...)
+
+	if !json.Valid(input) {
+		t.Fatalf("test input is not valid JSON")
+	}
+	doc, err := har.Parse(input)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	detail, err := doc.ResponseDetail(0)
+	if err != nil {
+		t.Fatalf("ResponseDetail returned error: %v", err)
+	}
+	if !bytes.Equal([]byte(detail.Response.Content.Text), []byte("\ufffd")) {
+		t.Fatalf("content text bytes = % x, want JSON replacement rune", []byte(detail.Response.Content.Text))
+	}
+}
+
+func TestResponseDetailDoesNotAllocateFullLargeTextBody(t *testing.T) {
+	bodySize := 4 << 20
+	input := `{
+	  "log": {
+	    "entries": [
+	      {
+	        "startedDateTime": "2026-05-17T10:00:00.000Z",
+	        "time": 1,
+	        "request": { "method": "GET", "url": "https://example.com/api/large" },
+	        "response": {
+	          "status": 200,
+	          "content": {
+	            "mimeType": "text/plain",
+	            "size": ` + jsonNumber(bodySize) + `,
+	            "text": ` + quoteJSONString(strings.Repeat("x", bodySize)) + `
+	          }
+	        }
+	      }
+	    ]
+	  }
+	}`
+
+	doc, err := har.Parse([]byte(input))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	detail, err := doc.ResponseDetail(0)
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("ResponseDetail returned error: %v", err)
+	}
+	if got, want := len(detail.Response.Content.Text), 200<<10; got != want {
+		t.Fatalf("preview length = %d, want %d", got, want)
+	}
+	if !detail.Response.Content.Truncated {
+		t.Fatalf("truncated = false, want true")
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(bodySize/2) {
+		t.Fatalf("ResponseDetail allocated %d bytes for a %d-byte body, want less than %d", allocated, bodySize, bodySize/2)
+	}
+}
+
 func TestResponseDetailRejectsInvalidIndex(t *testing.T) {
 	doc, err := har.Parse([]byte(sampleHAR))
 	if err != nil {
@@ -365,7 +529,32 @@ func TestBuildSubsetRejectsInvalidIndexes(t *testing.T) {
 	}
 }
 
+func TestWriteSubsetRejectsInvalidIndexesBeforeWriting(t *testing.T) {
+	doc, err := har.Parse([]byte(sampleHAR))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	for _, indexes := range [][]int{{}, {-1}, {2}} {
+		var out strings.Builder
+		if err := doc.WriteSubset(&out, indexes); err == nil {
+			t.Fatalf("WriteSubset(%v) returned nil error", indexes)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("WriteSubset(%v) wrote %q before returning an error", indexes, out.String())
+		}
+	}
+}
+
 func quoteJSONString(value string) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
+func jsonNumber(value int) string {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		panic(err)

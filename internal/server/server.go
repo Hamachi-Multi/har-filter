@@ -293,9 +293,7 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "session not found"})
 		return
 	}
-
-	subset, err := current.document.BuildSubset(request.Indexes)
-	if err != nil {
+	if err := current.document.ValidateSubset(request.Indexes); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
@@ -304,8 +302,10 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	setNoStoreHeaders(w.Header())
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filteredFileName(current.fileName)+`"`)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(subset)
+	if err := current.document.WriteSubset(w, request.Indexes); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
 }
 
 func (a *App) handleEntry(w http.ResponseWriter, r *http.Request) {

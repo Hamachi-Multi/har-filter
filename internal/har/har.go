@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // EntrySummary is the compact request metadata returned to the browser.
@@ -95,8 +97,8 @@ type entryDetailMeta struct {
 		URL      string   `json:"url"`
 		Headers  []Header `json:"headers"`
 		PostData struct {
-			MimeType string `json:"mimeType"`
-			Text     string `json:"text"`
+			MimeType string     `json:"mimeType"`
+			Text     detailText `json:"text"`
 		} `json:"postData"`
 	} `json:"request"`
 	Response struct {
@@ -104,15 +106,40 @@ type entryDetailMeta struct {
 		StatusText string   `json:"statusText"`
 		Headers    []Header `json:"headers"`
 		Content    struct {
-			MimeType string `json:"mimeType"`
-			Size     int64  `json:"size"`
-			Text     string `json:"text"`
-			Encoding string `json:"encoding"`
+			MimeType string     `json:"mimeType"`
+			Size     int64      `json:"size"`
+			Text     detailText `json:"text"`
+			Encoding string     `json:"encoding"`
 		} `json:"content"`
 	} `json:"response"`
 }
 
 const maxDetailTextBytes = 200 << 10
+
+var maxCapturedDetailTextBytes = base64.StdEncoding.EncodedLen(maxDetailTextBytes + 1)
+
+type detailText struct {
+	Text      string
+	Size      int64
+	Truncated bool
+}
+
+func (t *detailText) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*t = detailText{}
+		return nil
+	}
+	text, size, truncated, err := decodeJSONStringPreview(data, maxCapturedDetailTextBytes)
+	if err != nil {
+		return err
+	}
+	*t = detailText{
+		Text:      text,
+		Size:      size,
+		Truncated: truncated,
+	}
+	return nil
+}
 
 // Parse validates a HAR document and extracts summary metadata for every entry.
 func Parse(data []byte) (*Document, error) {
@@ -337,8 +364,10 @@ func (d *Document) ResponseDetail(index int) (ResponseDetail, error) {
 		return ResponseDetail{}, fmt.Errorf("decode entry detail: %w", err)
 	}
 
-	requestText, requestTruncated := truncateString(meta.Request.PostData.Text, maxDetailTextBytes)
-	responseText, responseEncoding, responseTruncated := decodeContentPreview(meta.Response.Content.Text, meta.Response.Content.Encoding, maxDetailTextBytes)
+	requestText, requestWasTruncated := truncateString(meta.Request.PostData.Text.Text, maxDetailTextBytes)
+	requestTruncated := requestWasTruncated || meta.Request.PostData.Text.Truncated
+	responseText, responseEncoding, responseWasTruncated := decodeContentPreview(meta.Response.Content.Text.Text, meta.Response.Content.Encoding, maxDetailTextBytes)
+	responseTruncated := responseWasTruncated || meta.Response.Content.Text.Truncated
 	return ResponseDetail{
 		Index: index,
 		Request: DetailRequest{
@@ -347,7 +376,7 @@ func (d *Document) ResponseDetail(index int) (ResponseDetail, error) {
 			Headers: meta.Request.Headers,
 			PostData: DetailContent{
 				MimeType:  meta.Request.PostData.MimeType,
-				Size:      int64(len(meta.Request.PostData.Text)),
+				Size:      meta.Request.PostData.Text.Size,
 				Text:      requestText,
 				Truncated: requestTruncated,
 			},
@@ -384,16 +413,205 @@ func decodeContentPreview(text string, encoding string, maxBytes int) (string, s
 	return string(decoded), "", false
 }
 
+func decodeJSONStringPreview(data []byte, maxBytes int) (string, int64, bool, error) {
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return "", 0, false, fmt.Errorf("decode JSON string preview: value is not a string")
+	}
+
+	preview := make([]byte, 0, min(maxBytes, len(data)-2))
+	var decodedSize int64
+	var truncated bool
+	appendDecoded := func(value []byte) bool {
+		decodedSize += int64(len(value))
+		if len(preview) >= maxBytes {
+			truncated = true
+			return false
+		}
+		remaining := maxBytes - len(preview)
+		if len(value) > remaining {
+			preview = append(preview, value[:remaining]...)
+			truncated = true
+			return false
+		}
+		preview = append(preview, value...)
+		return true
+	}
+
+scan:
+	for i := 1; i < len(data)-1; {
+		if data[i] != '\\' {
+			decodedRune, size := utf8.DecodeRune(data[i : len(data)-1])
+			var encoded [utf8.UTFMax]byte
+			n := utf8.EncodeRune(encoded[:], decodedRune)
+			if !appendDecoded(encoded[:n]) {
+				break scan
+			}
+			i += size
+			continue
+		}
+		if i+1 >= len(data)-1 {
+			return "", 0, false, fmt.Errorf("decode JSON string preview: incomplete escape")
+		}
+		switch data[i+1] {
+		case '"', '\\', '/':
+			if !appendDecoded(data[i+1 : i+2]) {
+				break scan
+			}
+			i += 2
+		case 'b':
+			if !appendDecoded([]byte{'\b'}) {
+				break scan
+			}
+			i += 2
+		case 'f':
+			if !appendDecoded([]byte{'\f'}) {
+				break scan
+			}
+			i += 2
+		case 'n':
+			if !appendDecoded([]byte{'\n'}) {
+				break scan
+			}
+			i += 2
+		case 'r':
+			if !appendDecoded([]byte{'\r'}) {
+				break scan
+			}
+			i += 2
+		case 't':
+			if !appendDecoded([]byte{'\t'}) {
+				break scan
+			}
+			i += 2
+		case 'u':
+			decodedRune, next, err := decodeJSONUnicodeEscape(data, i)
+			if err != nil {
+				return "", 0, false, err
+			}
+			var encoded [utf8.UTFMax]byte
+			n := utf8.EncodeRune(encoded[:], decodedRune)
+			if !appendDecoded(encoded[:n]) {
+				break scan
+			}
+			i = next
+		default:
+			return "", 0, false, fmt.Errorf("decode JSON string preview: invalid escape %q", data[i+1])
+		}
+	}
+
+	return string(preview), decodedSize, truncated, nil
+}
+
+func decodeJSONUnicodeEscape(data []byte, offset int) (rune, int, error) {
+	if offset+6 > len(data) {
+		return 0, 0, fmt.Errorf("decode JSON string preview: incomplete unicode escape")
+	}
+	first, ok := parseHexRune(data[offset+2 : offset+6])
+	if !ok {
+		return 0, 0, fmt.Errorf("decode JSON string preview: invalid unicode escape")
+	}
+	next := offset + 6
+	if utf16.IsSurrogate(first) {
+		if next+6 <= len(data) && data[next] == '\\' && data[next+1] == 'u' {
+			second, ok := parseHexRune(data[next+2 : next+6])
+			if ok {
+				if decoded := utf16.DecodeRune(first, second); decoded != utf8.RuneError {
+					return decoded, next + 6, nil
+				}
+			}
+		}
+		return utf8.RuneError, next, nil
+	}
+	return first, next, nil
+}
+
+func parseHexRune(data []byte) (rune, bool) {
+	if len(data) != 4 {
+		return 0, false
+	}
+	var value rune
+	for _, b := range data {
+		var digit rune
+		switch {
+		case b >= '0' && b <= '9':
+			digit = rune(b - '0')
+		case b >= 'a' && b <= 'f':
+			digit = rune(b-'a') + 10
+		case b >= 'A' && b <= 'F':
+			digit = rune(b-'A') + 10
+		default:
+			return 0, false
+		}
+		value = value*16 + digit
+	}
+	return value, true
+}
+
 // BuildSubset returns a valid HAR whose log.entries contains only selected indexes.
 func (d *Document) BuildSubset(indexes []int) ([]byte, error) {
-	if d == nil {
-		return nil, errors.New("document is nil")
+	var out bytes.Buffer
+	if err := d.WriteSubset(&out, indexes); err != nil {
+		return nil, err
 	}
+	return out.Bytes(), nil
+}
+
+// ValidateSubset reports whether indexes can be exported from the document.
+func (d *Document) ValidateSubset(indexes []int) error {
+	_, err := d.selectedIndexes(indexes)
+	return err
+}
+
+// WriteSubset writes a valid HAR whose log.entries contains only selected indexes.
+func (d *Document) WriteSubset(w io.Writer, indexes []int) error {
+	if d == nil {
+		return errors.New("document is nil")
+	}
+	selectedIndexes, err := d.selectedIndexes(indexes)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.WriteString(w, `{"log":{`); err != nil {
+		return fmt.Errorf("write HAR root: %w", err)
+	}
+	if len(d.version) > 0 {
+		if _, err := io.WriteString(w, `"version":`); err != nil {
+			return fmt.Errorf("write HAR version key: %w", err)
+		}
+		if _, err := w.Write(d.version); err != nil {
+			return fmt.Errorf("write HAR version: %w", err)
+		}
+		if _, err := io.WriteString(w, `,`); err != nil {
+			return fmt.Errorf("write HAR version separator: %w", err)
+		}
+	}
+
+	if _, err := io.WriteString(w, `"entries":[`); err != nil {
+		return fmt.Errorf("write HAR entries key: %w", err)
+	}
+	for i, index := range selectedIndexes {
+		if i > 0 {
+			if _, err := io.WriteString(w, `,`); err != nil {
+				return fmt.Errorf("write HAR entry separator: %w", err)
+			}
+		}
+		if _, err := w.Write(d.entries[index]); err != nil {
+			return fmt.Errorf("write HAR entry %d: %w", index, err)
+		}
+	}
+	if _, err := io.WriteString(w, `]}}`); err != nil {
+		return fmt.Errorf("write HAR close: %w", err)
+	}
+	return nil
+}
+
+func (d *Document) selectedIndexes(indexes []int) ([]int, error) {
 	if len(indexes) == 0 {
 		return nil, errors.New("at least one entry index is required")
 	}
 
-	selected := make([]json.RawMessage, 0, len(indexes))
+	selected := make([]int, 0, len(indexes))
 	seen := make(map[int]struct{}, len(indexes))
 	for _, index := range indexes {
 		if index < 0 || index >= len(d.entries) {
@@ -403,35 +621,9 @@ func (d *Document) BuildSubset(indexes []int) ([]byte, error) {
 			continue
 		}
 		seen[index] = struct{}{}
-		selected = append(selected, d.entries[index])
+		selected = append(selected, index)
 	}
-
-	root := make(map[string]json.RawMessage, 1)
-	logMap := make(map[string]json.RawMessage, 2)
-	if len(d.version) > 0 {
-		logMap["version"] = cloneRawMessage(d.version)
-	}
-
-	entriesJSON, err := json.Marshal(selected)
-	if err != nil {
-		return nil, fmt.Errorf("encode selected entries: %w", err)
-	}
-	logMap["entries"] = entriesJSON
-
-	logJSON, err := json.Marshal(logMap)
-	if err != nil {
-		return nil, fmt.Errorf("encode HAR log: %w", err)
-	}
-	root["log"] = logJSON
-
-	var out bytes.Buffer
-	encoder := json.NewEncoder(&out)
-	encoder.SetIndent("", "  ")
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(root); err != nil {
-		return nil, fmt.Errorf("encode subset HAR: %w", err)
-	}
-	return out.Bytes(), nil
+	return selected, nil
 }
 
 func estimateRetainedBytes(data []byte, version json.RawMessage, entries []json.RawMessage, summaries []EntrySummary) int64 {

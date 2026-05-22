@@ -111,7 +111,7 @@ harserver -addr 127.0.0.1:17680 -max-upload-mb 512
 | `-addr` | `127.0.0.1:17680` | HTTP listen address |
 | `-max-upload-mb` | `200` | Maximum HAR upload size in MiB |
 
-Uploaded HAR files are kept in memory for 30 minutes
+Uploaded HAR files are kept in memory for up to 30 minutes. Older sessions may be evicted earlier when the session memory cap is reached.
 
 ## Security Notes
 
@@ -125,12 +125,13 @@ HAR files often contain sensitive URLs, headers, cookies, tokens, and payloads
 
 ## API
 
-HAR Filter is primarily a browser app, but the local server exposes two JSON endpoints:
+HAR Filter is primarily a browser app, but the local server exposes local API endpoints used by the UI:
 
 | Endpoint | Description |
 | --- | --- |
 | `POST /api/upload` | Upload a HAR file in multipart field `har`; optional `replaceId` deletes a previous session after the new upload succeeds |
 | `POST /api/export` | Send `{ "id": "...", "indexes": [0, 3, 7] }` to download a HAR containing only those entries |
+| `POST /api/entry` | Send `{ "id": "...", "index": 0 }` to return request and response details; body text is a bounded preview and `truncated` reports when more data exists |
 
 ## Development
 
